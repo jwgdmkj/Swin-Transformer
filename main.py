@@ -29,6 +29,10 @@ from logger import create_logger
 from utils import load_checkpoint, load_pretrained, save_checkpoint, NativeScalerWithGradNormCount, auto_resume_helper, \
     reduce_tensor
 
+# python3 -m torch.distributed.launch --nproc_per_node 1 --master_port 10080  main.py --cfg configs/swin/swin_tiny_patch4_window7_224.yaml --data-path /data/dataset/imagenet/ --batch-size 4
+# python3 main.py --data-path /data/dataset/imagenet/ --model --cfg configs/swin/swin_tiny_patch4_window7_224.yaml --batch-size 4
+# python3 -m torch.distributed.launch --nproc_per_node 1 --master_port 10080 main.py --eval --cfg configs/swin/swin_base_patch4_window7_224.yaml --resume ./weights/swin_tiny_patch4_window7_224.pth --data-path /data/dataset/imagenet/
+# python3 -m torch.distributed.launch --nproc_per_node 1 --master_port 10080  main.py --cfg configs/swin/swin_cwsatiny_patch4_window7_224.yaml --data-path /data/dataset/imagenet/ --batch-size 4
 
 def parse_option():
     parser = argparse.ArgumentParser('Swin Transformer training and evaluation script', add_help=False)
@@ -64,7 +68,9 @@ def parse_option():
     parser.add_argument('--throughput', action='store_true', help='Test throughput only')
 
     # distributed training
-    parser.add_argument("--local_rank", type=int, required=True, help='local rank for DistributedDataParallel')
+    # parser.add_argument("--local_rank", type=int, required=True, help='local rank for DistributedDataParallel')
+    parser.add_argument('--local_rank', type=int, required=True,
+                        help='local rank for DistributedDataParallel')
 
     # for acceleration
     parser.add_argument('--fused_window_process', action='store_true',
@@ -85,6 +91,7 @@ def main(config):
     dataset_train, dataset_val, data_loader_train, data_loader_val, mixup_fn = build_loader(config)
 
     logger.info(f"Creating model:{config.MODEL.TYPE}/{config.MODEL.NAME}")
+
     model = build_model(config)
     logger.info(str(model))
 
@@ -98,7 +105,8 @@ def main(config):
     model_without_ddp = model
 
     optimizer = build_optimizer(config, model)
-    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[config.LOCAL_RANK], broadcast_buffers=False)
+    model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[config.LOCAL_RANK], broadcast_buffers=False,
+                                                      find_unused_parameters=True)
     loss_scaler = NativeScalerWithGradNormCount()
 
     if config.TRAIN.ACCUMULATION_STEPS > 1:
@@ -206,9 +214,14 @@ def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mix
             norm_meter.update(grad_norm)
         scaler_meter.update(loss_scale_value)
         batch_time.update(time.time() - end)
+
         end = time.time()
 
-        if idx % config.PRINT_FREQ == 0:
+        for name, param in model.named_parameters():
+            if param.grad is None:
+                print(f"Parameter {name} did not receive a gradient.")
+
+        if idx % (config.PRINT_FREQ) == 0:   # 100000
             lr = optimizer.param_groups[0]['lr']
             wd = optimizer.param_groups[0]['weight_decay']
             memory_used = torch.cuda.max_memory_allocated() / (1024.0 * 1024.0)
@@ -260,7 +273,7 @@ def validate(config, data_loader, model):
         batch_time.update(time.time() - end)
         end = time.time()
 
-        if idx % config.PRINT_FREQ == 0:
+        if idx % (config.PRINT_FREQ) == 0:  # 10000
             memory_used = torch.cuda.max_memory_allocated() / (1024.0 * 1024.0)
             logger.info(
                 f'Test: [{idx}/{len(data_loader)}]\t'
@@ -295,7 +308,6 @@ def throughput(data_loader, model, logger):
 
 if __name__ == '__main__':
     args, config = parse_option()
-
     if config.AMP_OPT_LEVEL:
         print("[warning] Apex amp has been deprecated, please use pytorch amp instead!")
 
@@ -306,6 +318,8 @@ if __name__ == '__main__':
     else:
         rank = -1
         world_size = -1
+
+
     torch.cuda.set_device(config.LOCAL_RANK)
     torch.distributed.init_process_group(backend='nccl', init_method='env://', world_size=world_size, rank=rank)
     torch.distributed.barrier()

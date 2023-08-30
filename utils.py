@@ -8,8 +8,9 @@
 import os
 import torch
 import torch.distributed as dist
-from torch._six import inf
-
+# from torch import inf
+import math
+inf = math.inf
 
 def load_checkpoint(config, model, optimizer, lr_scheduler, loss_scaler, logger):
     logger.info(f"==============> Resuming form {config.MODEL.RESUME}....................")

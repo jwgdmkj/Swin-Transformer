@@ -25,6 +25,10 @@ window_reverse : [4, 56/7, 56/7, 7, 7, 96] -> [4, 56, 56, 96] -> [4, 56x56, 96] 
 
 이를 depth[i]만큼 진행, 각 i별 output은 merge 기준
 [B, 784(28x28), 192] / [B, 196(14x14), 384] / [B, 49(7x7), 768]이 되며, 최종적으로 이 [B, 49, 738]에 mean을 적용한 [B, 768]
+
+관건 -
+기존 SwinT는 우선 window 별 파싱을 하고 Self-Attention 진행
+이를, Multi-Head까지 가고 나서 window parsing 하는 것으로 변경
 '''
 
 try:
@@ -68,14 +72,29 @@ def window_partition(x, window_size):
     Returns:
         windows: (num_windows*B, window_size, window_size, C)
     """
-    # print('window_partition & window_size ---- ', x.shape, window_size)
     B, H, W, C = x.shape
     x = x.view(B, H // window_size, window_size, W // window_size, window_size, C)
-    x = x.permute(0, 1, 3, 2, 4, 5).contiguous()
-    # print('window partition permute :', x.shape, ' by batch * H//wndw * W//wndw, wndw, wndw, chan')
-    windows = x.view(-1, window_size, window_size, C)
+    x = x.permute(0, 1, 3, 2, 4, 5).contiguous()    # [B, H/ws, W/ws, ws, ws, C]
+    windows = x.view(-1, window_size, window_size, C)   # [B x H/ws x W/ws, ws, ws, C]
     return windows
 
+def window_partition_v2(x, window_size, H, W):
+    """
+    Args:
+        x: (B, H, W, C)
+        window_size (int H, int W): window size
+
+    Returns:
+        windows: (num_windows*B, window_size, window_size, C)
+
+    x is already divided into Head(=H)
+    """
+    QKV, B, N, Head, C = x.shape
+    x = x.view(QKV, B, H, W, Head, C)
+    x = x.view(QKV, B, H // window_size[0], window_size[1], W // window_size[0], window_size[1], Head, C)
+    x = x.permute(0, 1, 2, 4, 3, 5, 6, 7).contiguous() # [QKV, B, H/ws, W/ws, ws, ws, Head, C]
+    windows = x.reshape(QKV, -1, Head, window_size[0] * window_size[1], C)    # [QKV, B x H/ws x W/ws, Head, ws x ws, C]
+    return windows
 
 def window_reverse(windows, window_size, H, W):
     """
@@ -91,12 +110,10 @@ def window_reverse(windows, window_size, H, W):
         x: (B, H, W, C)
     """
     B = int(windows.shape[0] / (H * W / window_size / window_size))
-    # print('window reverse input :', windows.shape, window_size, H, W, B)
     x = windows.view(B, H // window_size, W // window_size, window_size, window_size, -1)
-    # print('window reverse x :', x.shape)
     x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1)
-    # print('window reverse output :', x.shape)
     return x
+
 
 class WindowAttention(nn.Module):
     r""" Window based multi-head self attention (W-MSA) module with relative position bias.
@@ -151,58 +168,33 @@ class WindowAttention(nn.Module):
         Args:
             x: input features with shape of (num_windows*B, N, C)
             mask: (0/-inf) mask with shape of (num_windows, Wh*Ww, Wh*Ww) or None
-
-        1) qkv : [256, 49, 288]
-        2) qkv reshape and permute : [3, 256, 3, 49, 32] / q, k, v : [256, 3, 49, 32]
-        3) qkt : [256, 3, 49, 49] (=attn)
-        4) attn @ v : [256, 3, 49, 32]
-        5) x after reshape(B_ N C) : [256, 49, 96]
         """
-        # print('----------------------------- 4) ATTN Block ------------------------')
         B_, N, C = x.shape
-
         qkv = self.qkv(x)
-        # print('qkv : ', qkv.shape)
         qkv = qkv.reshape(B_, N, 3, self.num_heads, C // self.num_heads)
-        # print('qkv reshape : ', qkv.shape)
         qkv = qkv.permute(2, 0, 3, 1, 4)
-        # print('qkv after permute : ', qkv.shape)
         q, k, v = qkv[0], qkv[1], qkv[2]  # make torchscript happy (cannot use tensor as tuple)
         q = q * self.scale
         attn = (q @ k.transpose(-2, -1))
-        # print('attn first : ', attn.shape)
 
         relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(
             self.window_size[0] * self.window_size[1], self.window_size[0] * self.window_size[1], -1)  # Wh*Ww,Wh*Ww,nH
         relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()  # nH, Wh*Ww, Wh*Ww
         attn = attn + relative_position_bias.unsqueeze(0)
-        # print('attn second : ', attn.shape)
 
         if mask is not None:
-            # print('--------------------- mask start ------------------------')
             nW = mask.shape[0]
-            # print('| mask shape ', mask.shape)
             attn = attn.view(B_ // nW, nW, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
-            # print('| attn, nW ', attn.shape, nW)
             attn = attn.view(-1, self.num_heads, N, N)
-            # print('| attn view ', attn.shape)
             attn = self.softmax(attn)
-            # print('--------------------- mask over -------------------------')
         else:
             attn = self.softmax(attn)
 
         attn = self.attn_drop(attn)
-        # print('attn third : ', attn.shape)
 
-        x = (attn @ v)
-        # print('x after attn v ', x.shape)
-        x = x.transpose(1, 2)
-        x = x.reshape(B_, N, C)
-        # print('x after reshape ', x.shape)
-
+        x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
-        # print('attn output ', x.shape)
         return x
 
     def extra_repr(self) -> str:
@@ -221,6 +213,163 @@ class WindowAttention(nn.Module):
         flops += N * self.dim * self.dim
         return flops
 
+
+# -------------------------------------- CWSA --------------------------------------- #
+class ChannelwiseAttention(nn.Module):
+    r"""
+    Channel-wise Self Attention.
+    Some heads calculate CWSA and be concat with the other general MHSA.
+
+    Modified code is being '--added--
+    """
+    def __init__(self, dim, window_size, num_heads, chan_heads=1, qkv_bias=True, qk_scale=None, attn_drop=0.,
+                 proj_drop=0., bias=False):
+        super().__init__()
+        self.dim=dim
+        self.window_size = window_size  # Wh, Ww
+        self.num_heads = num_heads
+
+        # --added-- number of heads that calculate CWSA
+        self.chan_heads = chan_heads
+        assert self.num_heads >= self.chan_heads, 'Number of Multi-heads must be smaller than channel Heads!'
+
+        head_dim = dim // num_heads
+        self.scale = qk_scale or head_dim ** -0.5
+
+        # define a parameter table of relative position bias
+        # self.relative_position_bias_table = nn.Parameter(
+        #     torch.zeros((2 * window_size[0] - 1) * (2 * window_size[1] - 1), num_heads))  # 2*Wh-1 * 2*Ww-1, nH
+        self.relative_position_bias_table = nn.Parameter(
+            torch.zeros((2 * window_size[0] - 1) * (2 * window_size[1] - 1), num_heads - chan_heads))  # 2*Wh-1 * 2*Ww-1, nH
+
+        # get pair-wise relative position index for each token inside the window
+        coords_h = torch.arange(self.window_size[0])
+        coords_w = torch.arange(self.window_size[1])
+        coords = torch.stack(torch.meshgrid([coords_h, coords_w]))  # 2, Wh, Ww
+        coords_flatten = torch.flatten(coords, 1)  # 2, Wh*Ww
+        relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]  # 2, Wh*Ww, Wh*Ww
+        relative_coords = relative_coords.permute(1, 2, 0).contiguous()  # Wh*Ww, Wh*Ww, 2
+        relative_coords[:, :, 0] += self.window_size[0] - 1  # shift to start from 0
+        relative_coords[:, :, 1] += self.window_size[1] - 1
+        relative_coords[:, :, 0] *= 2 * self.window_size[1] - 1
+        relative_position_index = relative_coords.sum(-1)  # Wh*Ww, Wh*Ww
+        self.register_buffer("relative_position_index", relative_position_index)
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+
+        #  --added-- depth-wise convolution, no bias
+        # self.qkv_dwconv = nn.Conv2d(dim*3, dim*3, kernel_size=3, stride=1, padding=1, groups=dim*3, bias=bias)
+        # self.project_out = nn.Conv2d(dim, dim, kernel_size=1, bias=bias)
+        self.temperature = nn.Parameter(torch.ones(chan_heads, 1, 1))
+
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+        trunc_normal_(self.relative_position_bias_table, std=.02)
+        self.softmax = nn.Softmax(dim=-1)
+
+    def forward(self, x, mask=None):
+        """
+                Args:
+                    x: input features with shape of (num_windows*B, N, C)
+                    mask: (0/-inf) mask with shape of (num_windows, Wh*Ww, Wh*Ww) or None
+                """
+
+        B, H, W, C = x.shape    # [4, 56, 56, 96] / [4, 28, 28, 192]
+        N = H * W
+        x_ = x.reshape(B, N, C)    # [4, 3136, 96] / [4, 784, 192]
+
+        # --added --
+        qkv = self.qkv(x_)  # [B, 3136, 96x3 = 288] / [4, 784, 876]
+        B_, N_, C_ = qkv.shape
+        qkv = qkv.reshape(B_, N_, 3, self.num_heads, C//self.num_heads)   # [B, 3136, 3(=qkv), head, 96/head]
+        qkv = qkv.permute(3, 0, 1, 2, 4)    # [head, B, 3136, 3, (96, 192, 384, 768)/head(3, 6, 9, 12) = 32]
+
+        # --added-- split spatial head and channel head, if chan_head == 2,
+        qkv_mh = qkv[:-self.chan_heads,:,:,:,:] # [2, B, 3136, 3, 32] / [4, B, 784, 3, 32]
+        qkv_ch = qkv[-self.chan_heads:,:,:,:,:] # [1, B, 3136, 3, 32] / [2, B, 784, 3, 32]
+
+        # --added-- : MH ----------------------------------------------------------
+        qkv_mh = qkv_mh.reshape(3, B_, N_, self.num_heads - self.chan_heads, C//self.num_heads) # [3, B, 3136, 2, 32]
+        qkv_mh = window_partition_v2(qkv_mh, self.window_size, H, W)    # [3, 256, 2, 49, 32]
+        q_mh, k_mh, v_mh = qkv_mh[0], qkv_mh[1], qkv_mh[2]  # make torchscript happy (cannot use tensor as tuple)
+
+        q_mh = q_mh * self.scale
+        attn_mh = (q_mh @ k_mh.transpose(-2, -1))  # [256, 2, 49, 49] / [64, 4(28/7), 49, 49]
+
+        relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(
+            self.window_size[0] * self.window_size[1], self.window_size[0] * self.window_size[1], -1)  # Wh*Ww,Wh*Ww,nH
+        relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()  # nH, Wh*Ww, Wh*Ww
+        attn_mh = attn_mh + relative_position_bias.unsqueeze(0)
+
+        if mask is not None:
+            Bwin_, Head_, Winwin, Winwin = attn_mh.shape
+            nW = mask.shape[0]
+            attn_mh = attn_mh.view(Bwin_ // nW, nW, Head_, Winwin, Winwin) + mask.unsqueeze(1).unsqueeze(0)
+            attn_mh = attn_mh.view(-1, Head_, Winwin, Winwin)
+            attn_mh = self.softmax(attn_mh)
+        else:
+            attn_mh = self.softmax(attn_mh)
+
+        attn_mh = self.attn_drop(attn_mh)   # [256, 2, 49, 49]
+
+        x1 = attn_mh @ v_mh # [256, 2, 49, 32]
+        x1 = x1.transpose(1, 2) # [B, H-1, N, C/H] -> [B, N, H-1, H/C(=c)], reshape executed later
+        x1 = x1.permute(0, 2, 1, 3).reshape(B * (H//self.window_size[0]) * (W//self.window_size[1]),
+                                            self.window_size[0] * self.window_size[1], -1)  # [256, 49, 64] / [64, 49, 128]
+
+        # x = self.proj(x)
+        # x1 = self.proj_drop(x1) # [256, 49, 2, 32]
+
+        # --added-- : CH ----------------------------------------------------------
+        # qkv = self.qkv_dwconv(qkv)
+        qkv_ch = qkv_ch.reshape(3, B_, N_, self.chan_heads, C // self.num_heads)  # [3, B, 3136, 1, 32] / [3, 4, 784, 2, 32]
+        q_ch, k_ch, v_ch = qkv_ch[0], qkv_ch[1], qkv_ch[2]  # [B, 3136, 1, 32]
+        
+        q_ch = q_ch.permute(0, 2, 3, 1) # [B, 1, 32, 3136] / [4, 2, 32, 784]
+        k_ch = k_ch.permute(0, 2, 3, 1)
+        v_ch = v_ch.permute(0, 2, 3, 1)
+
+        q_ch = torch.nn.functional.normalize(q_ch, dim=-1)
+        k_ch = torch.nn.functional.normalize(k_ch, dim=-1)
+
+        attn_ch = (q_ch @ k_ch.transpose(-2, -1)) * self.temperature   # [B, 1, 32, 32] / [B, 2, 32, 32]
+        attn_ch = attn_ch.softmax(dim=-1)
+
+        x2 = (attn_ch @ v_ch).permute(0, 3, 1, 2) # [B, 1, 32, 3136] -> [B, 3136, 1, 32] / [B, 784, 2, 32]
+
+        # [256, 49, 1, 32]로 만들어야 함. 이후, [256, 49, 96]으로 만들어야 됨.
+        x2 = x2.view(B, H // self.window_size[0], self.window_size[0], W//self.window_size[1], self.window_size[1],
+                     self.chan_heads, -1)   # [B, 8, 8, 7, 7, 1, 32] / [B, 4, 4, 7, 7, 2, 32]
+        x2 = x2.permute(0, 1, 3, 2, 4, 5, 6).contiguous()   # [B, 8, 7, 8, 7, 1, 32]
+        x2 = x2.view(-1, self.window_size[0], self.window_size[1], self.chan_heads, C // self.num_heads)    # [256, 7, 7, 1, 32]
+        x2 = x2.view(-1, self.window_size[0] * self.window_size[1], self.chan_heads, C // self.num_heads)   # [256, 49, 1, 32] / [64, 49, 2, 32]
+        x2 = x2.reshape(-1, self.window_size[0] * self.window_size[1], self.chan_heads * C // self.num_heads) # [256, 49, 32] / [64, 49, 64]
+
+        # added -- cat
+        out = torch.cat((x1, x2), dim=2)    # [B, N, H, c] -> [B, N, C]
+        out = self.proj(out)
+        out = self.proj_drop(out)
+
+        return out  # [256, 49, 96] / [64, 49, 192]
+
+
+    def flops(self, N):
+        # calculate flops for 1 window with token length of N
+        flops = 0
+        # qkv = self.qkv(x)
+        flops += N * self.dim * 3 * self.dim
+        # attn = (q @ k.transpose(-2, -1))
+        flops += self.num_heads * N * (self.dim // self.num_heads) * N
+        #  x = (attn @ v)
+        flops += self.num_heads * N * N * (self.dim // self.num_heads)
+        # x = self.proj(x)
+        flops += N * self.dim * self.dim
+        return flops
+
+
+# -------------------------------------- CWSA end -------------------------------- #
 
 class SwinTransformerBlock(nn.Module):
     r""" Swin Transformer Block.
@@ -245,7 +394,7 @@ class SwinTransformerBlock(nn.Module):
     def __init__(self, dim, input_resolution, num_heads, window_size=7, shift_size=0,
                  mlp_ratio=4., qkv_bias=True, qk_scale=None, drop=0., attn_drop=0., drop_path=0.,
                  act_layer=nn.GELU, norm_layer=nn.LayerNorm,
-                 fused_window_process=False):
+                 fused_window_process=False, chan_heads=1):
         super().__init__()
         self.dim = dim
         self.input_resolution = input_resolution
@@ -260,8 +409,12 @@ class SwinTransformerBlock(nn.Module):
         assert 0 <= self.shift_size < self.window_size, "shift_size must in 0-window_size"
 
         self.norm1 = norm_layer(dim)
-        self.attn = WindowAttention(
-            dim, window_size=to_2tuple(self.window_size), num_heads=num_heads,
+        # self.attn = WindowAttention(
+        #     dim, window_size=to_2tuple(self.window_size), num_heads=num_heads,
+        #     qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
+
+        self.attn = ChannelwiseAttention(
+            dim, window_size=to_2tuple(self.window_size), num_heads=num_heads, chan_heads=chan_heads,
             qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
 
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
@@ -296,56 +449,35 @@ class SwinTransformerBlock(nn.Module):
         self.fused_window_process = fused_window_process
 
     def forward(self, x):
-        '''
-        1) input : [B, sq of 56/28/14/7(56), 96/12/256/512(96)
-        2) after view : [B, 56, 56, 96]
-        3-1) window_partition view & permute : [4, 8, 8, 7, 7, 96]
-        3-2) window_partition output : [256, 7, 7, 96]
-        4) x_windows : [256, 49, 96] by [-1, wn x wn, embed]
-        5) attn_windows : [256, 49, 96]
-        6) attn_windows after view : [256, 7, 7, 96] by [-1, wn, wn, embed]
-        7-1) window_reverse : [4, 8, 8, 7, 7, 96]
-        7-2) window_reverse output : [4, 56, 56, 96]
-        8) x after roll and view : [4, 3136, 96] = output
-        '''
         H, W = self.input_resolution
         B, L, C = x.shape
         assert L == H * W, "input feature has wrong size"
 
         # print('----------------------------- 3) SwinT Block ------------------------')
-        # print('SwinTBlock : ', x.shape)
-        # print('shift size : ', self.shift_size)
-
         shortcut = x
         x = self.norm1(x)
-        # print('x after norm : ', x.shape)
         x = x.view(B, H, W, C)
-        # print('x after view : ', x.shape)
 
         # cyclic shift
         if self.shift_size > 0:
             if not self.fused_window_process:
                 shifted_x = torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
                 # partition windows
-                x_windows = window_partition(shifted_x, self.window_size)  # nW*B, window_size, window_size, C
+                # x_windows = window_partition(shifted_x, self.window_size)  # nW*B, window_size, window_size, C
             else:
                 x_windows = WindowProcess.apply(x, B, H, W, C, -self.shift_size, self.window_size)
         else:
             shifted_x = x
             # partition windows
-            x_windows = window_partition(shifted_x, self.window_size)  # nW*B, window_size, window_size, C
+            # x_windows = window_partition(shifted_x, self.window_size)  # nW*B, window_size, window_size, C
 
-        # print('x_win 1 : ', x_windows.shape, ' by [-1, wn, wn, chan]')
-        x_windows = x_windows.view(-1, self.window_size * self.window_size, C)  # nW*B, window_size*window_size, C
-        # print('x_win 2 : ', x_windows.shape, ' by [-1, wn * wn, chan]')
+        # x_windows = x_windows.view(-1, self.window_size * self.window_size, C)  # nW*B, window_size*window_size, C
 
         # W-MSA/SW-MSA
-        attn_windows = self.attn(x_windows, mask=self.attn_mask)  # nW*B, window_size*window_size, C
-        # print('attn window shape : ', attn_windows.shape)
+        attn_windows = self.attn(shifted_x, mask=self.attn_mask)  # [256, 49, 96]이 되어야 함
 
         # merge windows
         attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
-        # print('attn window shape : ', attn_windows.shape, ' by [-1, wndw, wndw, chan]')
 
         # reverse cyclic shift
         if self.shift_size > 0:
@@ -358,13 +490,11 @@ class SwinTransformerBlock(nn.Module):
             shifted_x = window_reverse(attn_windows, self.window_size, H, W)  # B H' W' C
             x = shifted_x
         x = x.view(B, H * W, C)
-        # print('SwinTBlock shifted_x : ', x.shape, ' by view [B, H * W, C]')
         x = shortcut + self.drop_path(x)
-        # print('SwinTBlock output : ', x.shape)
+
         # FFN
         x = x + self.drop_path(self.mlp(self.norm2(x)))
 
-        # print('SwinT output : ', x.shape)
         return x
 
     def extra_repr(self) -> str:
@@ -459,7 +589,8 @@ class BasicLayer(nn.Module):
     def __init__(self, dim, input_resolution, depth, num_heads, window_size,
                  mlp_ratio=4., qkv_bias=True, qk_scale=None, drop=0., attn_drop=0.,
                  drop_path=0., norm_layer=nn.LayerNorm, downsample=None, use_checkpoint=False,
-                 fused_window_process=False):
+                 fused_window_process=False,
+                 chan_heads=1):
 
         super().__init__()
         self.dim = dim
@@ -477,7 +608,8 @@ class BasicLayer(nn.Module):
                                  drop=drop, attn_drop=attn_drop,
                                  drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
                                  norm_layer=norm_layer,
-                                 fused_window_process=fused_window_process)
+                                 fused_window_process=fused_window_process,
+                                 chan_heads=chan_heads)
             for i in range(depth)])
 
         # patch merging layer
@@ -492,10 +624,7 @@ class BasicLayer(nn.Module):
             if self.use_checkpoint:
                 x = checkpoint.checkpoint(blk, x)
             else:
-                # print('Basic input shape : ', x.shape)
-                # print('Basic SwinBlock param : ',self.dim, self.input_resolution)
                 x = blk(x)
-                # print('Basic Output : ', x.shape)
         if self.downsample is not None:
             x = self.downsample(x)
         return x
@@ -592,7 +721,7 @@ class SwinTransformer(nn.Module):
                  window_size=7, mlp_ratio=4., qkv_bias=True, qk_scale=None,
                  drop_rate=0., attn_drop_rate=0., drop_path_rate=0.1,
                  norm_layer=nn.LayerNorm, ape=False, patch_norm=True,
-                 use_checkpoint=False, fused_window_process=False, **kwargs):
+                 use_checkpoint=False, fused_window_process=False, chan_heads=[1, 1, 1, 1], **kwargs):
         super().__init__()
 
         self.num_classes = num_classes
@@ -621,6 +750,9 @@ class SwinTransformer(nn.Module):
         # stochastic depth
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]  # stochastic depth decay rule
 
+        # CWSA
+        self.chan_heads = chan_heads
+
         # build layers
         self.layers = nn.ModuleList()
         for i_layer in range(self.num_layers):
@@ -637,7 +769,9 @@ class SwinTransformer(nn.Module):
                                norm_layer=norm_layer,
                                downsample=PatchMerging if (i_layer < self.num_layers - 1) else None,
                                use_checkpoint=use_checkpoint,
-                               fused_window_process=fused_window_process)
+                               fused_window_process=fused_window_process,
+                               chan_heads=chan_heads[i_layer])
+
             self.layers.append(layer)
 
         self.norm = norm_layer(self.num_features)
@@ -665,33 +799,22 @@ class SwinTransformer(nn.Module):
 
     def forward_features(self, x):
         # print('----------------------------- 1) SwinTransformer-----------------------------')
-        # print('fisrt feature : ', x.shape)
         x = self.patch_embed(x)
         if self.ape:
             x = x + self.absolute_pos_embed
         x = self.pos_drop(x)
 
         for i, layer in enumerate(self.layers):
-            # print('forward features :', x.shape)
-            # print('Layer parameter : ', i, 'embed_dim * 2 ** i - ', int(self.embed_dim * 2 ** i),
-            #       'patch_reso // (2**i) - ',
-            #       (self.patches_resolution[0] // (2 ** i), self.patches_resolution[1] // (2 ** i)))
             x = layer(x)
-            # print('------------------------------------------------------------------------')
 
-        # print('swinT layer over : ', x.shape)
         x = self.norm(x)  # B L C
-        # print('after norm : ', x.shape)
         x = self.avgpool(x.transpose(1, 2))  # B C 1
         x = torch.flatten(x, 1)
-        # print('layer forward output : ', x.shape)
         return x
 
     def forward(self, x):
         x = self.forward_features(x)
         x = self.head(x)
-        # print('final output :', x.shape)
-        # print('-----------------------SwinT over----------------------')
         return x
 
     def flops(self):
