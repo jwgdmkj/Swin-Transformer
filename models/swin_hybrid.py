@@ -16,6 +16,7 @@ import matplotlib.pyplot as plt
 from einops import rearrange
 import math
 import torch.nn.functional as F
+
 '''
 각각에 따른 shape 변화(window_size: 8 & input shape: [B, 3, 224, 224] & 임베딩: [B, 3136(56X56), 96(임베딩 차원)] 가정
 depth: [2, 2, 18, 2], window_size를 [7, 7, 7, 7]이라 가정 시
@@ -32,8 +33,8 @@ window_reverse : [4, 56/7, 56/7, 7, 7, 96] -> [4, 56, 56, 96] -> [4, 56x56, 96] 
 [B, 784(28x28), 192] / [B, 196(14x14), 384] / [B, 49(7x7), 768]이 되며, 최종적으로 이 [B, 49, 738]에 mean을 적용한 [B, 768]
 
 관건 -
-기존 SwinT는 우선 window 별 파싱을 하고 Self-Attention 진행
-이를, Multi-Head까지 가고 나서 window parsing 하는 것으로 변경
+우선, dual-former을 따르지 않고, 오직 1/2로만 진행
+MLP와 concat gate를 만들어야 함.  --> hybrid에서는 ACM, MBFFN
 '''
 
 try:
@@ -47,6 +48,7 @@ except:
     WindowProcess = None
     WindowProcessReverse = None
     print("[Warning] Fused window process have not been installed. Please refer to get_started.md for installation.")
+
 
 ##############################################################################
 ## MLP module
@@ -68,6 +70,7 @@ class Mlp(nn.Module):
         x = self.drop(x)
         return x
 
+
 class GDFN(nn.Module):
     def __init__(self, dim, ffn_expansion_factor, bias):
         super(GDFN, self).__init__()
@@ -85,6 +88,14 @@ class GDFN(nn.Module):
         return x
 
 
+class GCFN(nn.Module):
+    def __init__(self, dim, ffn_expansion_factor, bias):
+        super(GCFN, self).__init__()
+        pass
+
+    def forward(self, x):
+        pass
+
 ##########################################################################
 ## window reshape
 def window_partition(x, window_size):
@@ -98,9 +109,10 @@ def window_partition(x, window_size):
     """
     B, H, W, C = x.shape
     x = x.view(B, H // window_size, window_size, W // window_size, window_size, C)
-    x = x.permute(0, 1, 3, 2, 4, 5).contiguous()    # [B, H/ws, W/ws, ws, ws, C]
-    windows = x.view(-1, window_size, window_size, C)   # [B x H/ws x W/ws, ws, ws, C]
+    x = x.permute(0, 1, 3, 2, 4, 5).contiguous()  # [B, H/ws, W/ws, ws, ws, C]
+    windows = x.view(-1, window_size, window_size, C)  # [B x H/ws x W/ws, ws, ws, C]
     return windows
+
 
 def window_partition_v2(x, window_size, H, W):
     """
@@ -116,9 +128,10 @@ def window_partition_v2(x, window_size, H, W):
     QKV, B, N, Head, C = x.shape
     x = x.view(QKV, B, H, W, Head, C)
     x = x.view(QKV, B, H // window_size[0], window_size[1], W // window_size[0], window_size[1], Head, C)
-    x = x.permute(0, 1, 2, 4, 3, 5, 6, 7).contiguous() # [QKV, B, H/ws, W/ws, ws, ws, Head, C]
-    windows = x.reshape(QKV, -1, Head, window_size[0] * window_size[1], C)    # [QKV, B x H/ws x W/ws, Head, ws x ws, C]
+    x = x.permute(0, 1, 2, 4, 3, 5, 6, 7).contiguous()  # [QKV, B, H/ws, W/ws, ws, ws, Head, C]
+    windows = x.reshape(QKV, -1, Head, window_size[0] * window_size[1], C)  # [QKV, B x H/ws x W/ws, Head, ws x ws, C]
     return windows
+
 
 def window_reverse(windows, window_size, H, W):
     """
@@ -139,134 +152,154 @@ def window_reverse(windows, window_size, H, W):
     return x
 
 
-##########################################################################
-## Attn
-class WindowAttention(nn.Module):
-    r""" Window based multi-head self attention (W-MSA) module with relative position bias.
-    It supports both of shifted and non-shifted window.
+##########################################################################################
+## Channel and Spaital Mixing
+class BasicConv(nn.Module):
+    def __init__(self, in_planes, out_planes, kernel_size, stride=1, padding=0, dilation=1, groups=1, relu=True,
+                 bn=False, bias=False):
+        super(BasicConv, self).__init__()
+        self.out_channels = out_planes
+        self.conv = nn.Conv2d(in_planes, out_planes, kernel_size=kernel_size, stride=stride, padding=padding,
+                              dilation=dilation, groups=groups, bias=bias)
+        self.bn = nn.BatchNorm2d(out_planes, eps=1e-5, momentum=0.01, affine=True) if bn else None
+        self.relu = nn.ReLU() if relu else None
 
-    Args:
-        dim (int): Number of input channels.
-        window_size (tuple[int]): The height and width of the window.
-        num_heads (int): Number of attention heads.
-        qkv_bias (bool, optional):  If True, add a learnable bias to query, key, value. Default: True
-        qk_scale (float | None, optional): Override default qk scale of head_dim ** -0.5 if set
-        attn_drop (float, optional): Dropout ratio of attention weight. Default: 0.0
-        proj_drop (float, optional): Dropout ratio of output. Default: 0.0
-    """
-
-    def __init__(self, dim, window_size, num_heads, qkv_bias=True, qk_scale=None, attn_drop=0., proj_drop=0.):
-
-        super().__init__()
-        self.dim = dim
-        self.window_size = window_size  # Wh, Ww
-        self.num_heads = num_heads
-        head_dim = dim // num_heads
-        self.scale = qk_scale or head_dim ** -0.5
-
-        # define a parameter table of relative position bias
-        self.relative_position_bias_table = nn.Parameter(
-            torch.zeros((2 * window_size[0] - 1) * (2 * window_size[1] - 1), num_heads))  # 2*Wh-1 * 2*Ww-1, nH
-
-        # get pair-wise relative position index for each token inside the window
-        coords_h = torch.arange(self.window_size[0])
-        coords_w = torch.arange(self.window_size[1])
-        coords = torch.stack(torch.meshgrid([coords_h, coords_w]))  # 2, Wh, Ww
-        coords_flatten = torch.flatten(coords, 1)  # 2, Wh*Ww
-        relative_coords = coords_flatten[:, :, None] - coords_flatten[:, None, :]  # 2, Wh*Ww, Wh*Ww
-        relative_coords = relative_coords.permute(1, 2, 0).contiguous()  # Wh*Ww, Wh*Ww, 2
-        relative_coords[:, :, 0] += self.window_size[0] - 1  # shift to start from 0
-        relative_coords[:, :, 1] += self.window_size[1] - 1
-        relative_coords[:, :, 0] *= 2 * self.window_size[1] - 1
-        relative_position_index = relative_coords.sum(-1)  # Wh*Ww, Wh*Ww
-        self.register_buffer("relative_position_index", relative_position_index)
-
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
-        self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(dim, dim)
-        self.proj_drop = nn.Dropout(proj_drop)
-
-        trunc_normal_(self.relative_position_bias_table, std=.02)
-        self.softmax = nn.Softmax(dim=-1)
-
-    def forward(self, x, mask=None):
-        """
-        Args:
-            x: input features with shape of (num_windows*B, N, C)
-            mask: (0/-inf) mask with shape of (num_windows, Wh*Ww, Wh*Ww) or None
-        """
-        B_, N, C = x.shape
-        qkv = self.qkv(x)
-        qkv = qkv.reshape(B_, N, 3, self.num_heads, C // self.num_heads)
-        qkv = qkv.permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]  # make torchscript happy (cannot use tensor as tuple)
-        q = q * self.scale
-        attn = (q @ k.transpose(-2, -1))
-
-        relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(
-            self.window_size[0] * self.window_size[1], self.window_size[0] * self.window_size[1], -1)  # Wh*Ww,Wh*Ww,nH
-        relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()  # nH, Wh*Ww, Wh*Ww
-        attn = attn + relative_position_bias.unsqueeze(0)
-
-        if mask is not None:
-            nW = mask.shape[0]
-            attn = attn.view(B_ // nW, nW, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
-            attn = attn.view(-1, self.num_heads, N, N)
-            attn = self.softmax(attn)
-        else:
-            attn = self.softmax(attn)
-
-        attn = self.attn_drop(attn)
-
-        x = (attn @ v).transpose(1, 2).reshape(B_, N, C)
-        x = self.proj(x)
-        x = self.proj_drop(x)
+    def forward(self, x):
+        x = self.conv(x)
+        if self.bn is not None:
+            x = self.bn(x)
+        if self.relu is not None:
+            x = self.relu(x)
         return x
 
-    def extra_repr(self) -> str:
-        return f'dim={self.dim}, window_size={self.window_size}, num_heads={self.num_heads}'
 
-    def flops(self, N):
-        # calculate flops for 1 window with token length of N
-        flops = 0
-        # qkv = self.qkv(x)
-        flops += N * self.dim * 3 * self.dim
-        # attn = (q @ k.transpose(-2, -1))
-        flops += self.num_heads * N * (self.dim // self.num_heads) * N
-        #  x = (attn @ v)
-        flops += self.num_heads * N * N * (self.dim // self.num_heads)
-        # x = self.proj(x)
-        flops += N * self.dim * self.dim
-        return flops
+class ChannelPool(nn.Module):
+    def forward(self, x):
+        return torch.cat((torch.max(x, 1)[0].unsqueeze(1), torch.mean(x, 1).unsqueeze(1)), dim=1)
 
 
-# -------------------------------------- CWSA --------------------------------------- #
-class ChannelwiseAttention(nn.Module):
+# 2)
+class spatial_attn_layer(nn.Module):
+    def __init__(self, kernel_size=5):
+        super(spatial_attn_layer, self).__init__()
+        self.compress = ChannelPool()
+        self.spatial = BasicConv(2, 1, kernel_size, stride=1, padding=(kernel_size - 1) // 2, relu=False)
+        print('2) init : ', self.spatial)
+
+    def forward(self, x):
+        print('2) input : ', x.shape)
+        x_compress = self.compress(x)
+        print('2) after GAP, GMP: ', x_compress.shape)
+
+        x_out = self.spatial(x_compress)
+        print('2) after spatial: ', x_out.shape)
+
+        scale = torch.sigmoid(x_out)  # broadcasting
+        return x * scale
+
+class ca_layer(nn.Module):
+    def __init__(self, channel, reduction=8, bias=True):
+        super(ca_layer, self).__init__()
+        # global average pooling: feature --> point
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        # feature channel downscale and upscale --> channel weight
+        self.conv_du = nn.Sequential(
+            nn.Conv2d(channel, channel // reduction, 1, padding=0, bias=bias),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channel // reduction, channel, 1, padding=0, bias=bias),
+            nn.Sigmoid()
+        )
+        print('3) init : ', self.conv_du)
+
+    def forward(self, x):
+        print('3) input : ', x.shape)
+        y = self.avg_pool(x)
+        print('3) after pool : ', y.shape)
+        y = self.conv_du(y)
+        print('3) after du : ', y.shape)
+        return x * y
+
+class DAU(nn.Module):
+    '''
+    1) Conv - GELU - Conv
+    2) 1)의 GAP, GMP 이후 concat - Conv - Sigmoid, 1)과 Element-wise
+    3) 1)의 GAP, Conv, Gelu, Conv, Sigmoid, 1)과 Element-wise
+    4) 2) 3)을 Concat, Conv, 이후 원본과 element-sum
+    '''
+    def __init__(self, dim, kernel_size=3, reduction=8, bias=False, act=nn.ReLU()):
+        super(DAU, self).__init__()
+        self.body = nn.Sequential(
+            nn.Conv2d(dim, dim, kernel_size, bias),
+            act,
+            nn.Conv2d(dim // 2, dim, kernel_size, bias)
+        )
+
+        ## Spatial Attention
+        self.SA = spatial_attn_layer()
+
+        ## Channel Attention
+        self.CA = ca_layer(dim, reduction, bias=bias)
+
+        self.conv1x1 = nn.Conv2d(dim * 2, dim, kernel_size=1, bias=bias)
+        print('4) init : ', self.conv1x1)
+
+
+    def forward(self, x):
+        print('0) x input : ', x.shape)
+        res = self.body(x)
+        print('1) x after CGC : ', x.shape)
+
+        sa_branch = self.SA(res)
+        print('2) x after SA : ', x.shape)
+
+        ca_branch = self.CA(res)
+        print('3) x after CA : ', x.shape)
+
+        res = torch.cat([sa_branch, ca_branch], dim=1)
+        res = self.conv1x1(res)
+        print('4) x final : ', x.shape)
+        res += x
+
+        import pdb;pdb.set_trace()
+        return res
+
+
+class SimpleGate(nn.Module):
+    def forward(self, x):
+        x1, x2 = x.chunk(2, dim=1)
+        return x1 * x2
+
+##########################################################################################
+## Fourth Arch : Calculate Attn
+class HybridAttention(nn.Module):
     r"""
     Channel-wise Self Attention.
     Some heads calculate CWSA and be concat with the other general MHSA.
 
     Modified code is being '--added--
     """
+
     def __init__(self, dim, window_size, num_heads, chan_heads=1, qkv_bias=True, qk_scale=None, attn_drop=0.,
                  proj_drop=0., bias=False, depth=0, layer_idx=0):
         super().__init__()
-        self.dim=dim
+        
+        # dim = input으로부터 1/2로 나눠짐
+        self.dim = dim // 2
         self.window_size = window_size  # Wh, Ww
         self.num_heads = num_heads
 
         # --added-- number of heads that calculate CWSA
         self.chan_heads = chan_heads
-        assert self.num_heads >= self.chan_heads, 'Number of Multi-heads must be smaller than channel Heads!'
 
-        head_dim = dim // num_heads
+        # hybrid : 다시 1/2로 쪼개서 cw, sw로 나눠야됨.
+        head_dim = (dim//2) // num_heads
         self.scale = qk_scale or head_dim ** -0.5
 
         # define a parameter table of relative position bias
-        self.relative_position_bias_table = nn.Parameter(
+        self.relative_position_bias_table_sw = nn.Parameter(
             torch.zeros((2 * window_size[0] - 1) * (2 * window_size[1] - 1), num_heads))  # 2*Wh-1 * 2*Ww-1, nH
-        self.relative_position_bias_table = nn.Parameter(
-            torch.zeros((2 * window_size[0] - 1) * (2 * window_size[1] - 1), num_heads - chan_heads))  # 2*Wh-1 * 2*Ww-1, nH
+        self.relative_position_bias_table_cw = nn.Parameter(
+            torch.zeros((2 * window_size[0] - 1) * (2 * window_size[1] - 1), chan_heads))  # 2*Wh-1 * 2*Ww-1, nH
 
         # get pair-wise relative position index for each token inside the window
         coords_h = torch.arange(self.window_size[0])
@@ -281,11 +314,13 @@ class ChannelwiseAttention(nn.Module):
         relative_position_index = relative_coords.sum(-1)  # Wh*Ww, Wh*Ww
         self.register_buffer("relative_position_index", relative_position_index)
 
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        # Spatial QKV
+        self.qkv = nn.Linear(self.dim, self.dim * 3, bias=qkv_bias)
 
         #  --added-- depth-wise convolution, no bias
-        self.qkv_dwconv = nn.Conv2d(dim*3, dim*3, kernel_size=3, stride=1, padding=1, groups=dim*3, bias=bias)
-        self.project_out = nn.Conv2d(dim, dim, kernel_size=1, bias=bias)
+        self.qkv_dwconv = nn.Conv2d(self.dim * 3, self.dim * 3, kernel_size=3, stride=1, padding=1,
+                                    groups=self.dim * 3, bias=bias)
+        self.project_out = nn.Conv2d(self.dim, self.dim, kernel_size=1, bias=bias)
         self.temperature = nn.Parameter(torch.ones(chan_heads, 1, 1))
 
         # FFN
@@ -299,112 +334,86 @@ class ChannelwiseAttention(nn.Module):
         self.depth = depth
         self.layer_idx = layer_idx
 
+        # Spatial and Channel Mixing
+        act = SimpleGate()
+        self.mix = DAU(dim, kernel_size=3, reduction=4, bias=bias, act=act)
+
+
+
     def forward(self, x, mask=None):
         """
-                Args:
-                    x: input features with shape of (num_windows*B, N, C)
-                    mask: (0/-inf) mask with shape of (num_windows, Wh*Ww, Wh*Ww) or None
-                """
-        # print('1) x input shape : ', x.shape)
-        B, H, W, C = x.shape    # [4, 56, 56, 96] / [4, 28, 28, 192]
-        N = H * W
-        x_ = x.reshape(B, N, C)    # [4, 3136, 96] / [4, 784, 192]
+        Args:
+            x1: input features with shape of (num_windows*B, N, C)
+            x2 : B H W C
+            mask: (0/-inf) mask with shape of (num_windows, Wh*Ww, Wh*Ww) or None
+        """
+        x1, x2 = x[0], x[1]
 
-        # --added --
-        qkv = self.qkv(x_)  # [B, 3136, 96x3 = 288] / [4, 784, 876]
-        B_, N_, C_ = qkv.shape
-        qkv = qkv.reshape(B_, N_, 3, self.num_heads, C//self.num_heads)   # [B, 3136, 3(=qkv), head, 96/head]
-        qkv = qkv.permute(3, 0, 1, 2, 4)    # [head, B, 3136, 3, (96, 192, 384, 768)/head(3, 6, 9, 12) = 32]
+        # --------------------------- Spatial Attn ------------------------- #
+        B1, N1, C1 = x1.shape
 
-        # --added-- split spatial head and channel head, if chan_head == 2,
-        qkv_mh = qkv[:-self.chan_heads,:,:,:,:] # [2, B, 3136, 3, 32] / [4, B, 784, 3, 32]
-        qkv_ch = qkv[-self.chan_heads:,:,:,:,:] # [1, B, 3136, 3, 32] / [2, B, 784, 3, 32]
-        mh_flag = False
+        qkv = self.qkv(x1).reshape(B1, N1, self.num_heads, C1//self.num_heads).permute(2,0,3,1,4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
 
-        # print('2) qkv mh shape : ', qkv_mh.shape)
-        # print('3) qkv ch shape : ', qkv_ch.shape)
+        q = q * self.scale
+        attn = (q @ k.transpose(-2, -1))
 
-        # --added-- : MH ----------------------------------------------------------
-        if qkv_mh.shape[0] != 0:
-            mh_flag = True
-            qkv_mh = qkv_mh.reshape(3, B_, N_, self.num_heads - self.chan_heads, C//self.num_heads) # [3, B, 3136, 2, 32]
-            qkv_mh = window_partition_v2(qkv_mh, self.window_size, H, W)    # [3, 256, 2, 49, 32]
-            q_mh, k_mh, v_mh = qkv_mh[0], qkv_mh[1], qkv_mh[2]  # make torchscript happy (cannot use tensor as tuple)
+        relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(
+            self.window_size[0] * self.window_size[1], self.window_size[0] * self.window_size[1], -1)  # Wh*Ww,Wh*Ww,nH
+        relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()  # nH, Wh*Ww, Wh*Ww
+        attn = attn + relative_position_bias.unsqueeze(0)
 
-            q_mh = q_mh * self.scale
-            attn_mh = (q_mh @ k_mh.transpose(-2, -1))  # [256, 2, 49, 49] / [64, 4(28/7), 49, 49]
+        if mask is not None:
+            nW = mask.shape[0]
+            attn = attn.view(B1 // nW, nW, self.num_heads, N1, N1)
+            attn = attn + mask.unsqueeze(1).unsqueeze(0)
+            attn = attn.view(-1, self.num_heads, N1, N1)
+            attn = self.softmax(attn)
+        else:
+            attn = self.softmax(attn)
 
-            relative_position_bias = self.relative_position_bias_table[self.relative_position_index.view(-1)].view(
-                self.window_size[0] * self.window_size[1], self.window_size[0] * self.window_size[1], -1)  # Wh*Ww,Wh*Ww,nH
-            relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()  # nH, Wh*Ww, Wh*Ww
-            attn_mh = attn_mh + relative_position_bias.unsqueeze(0)
+        attn_s = self.attn_drop(attn)
+        attn_s = (attn_s @ v)
+        x1 = attn_s.transpose(1, 2)
+        x1 = x1.reshape(B1, N1, C1)
+        # --------------------------- Spatial Over ------------------------- #
 
-            # print('4) q mh after shape : ', q_mh.shape)
-            # print('5) attn mh shape : ', attn_mh.shape)
+        # --------------------------- Channel Attn ------------------------- #
+        B2, H2, W2, C2 = x2.shape
 
-            if mask is not None:
-                Bwin_, Head_, Winwin, Winwin = attn_mh.shape
-                nW = mask.shape[0]
-                attn_mh = attn_mh.view(Bwin_ // nW, nW, Head_, Winwin, Winwin) + mask.unsqueeze(1).unsqueeze(0)
-                attn_mh = attn_mh.view(-1, Head_, Winwin, Winwin)
-                attn_mh = self.softmax(attn_mh)
-            else:
-                attn_mh = self.softmax(attn_mh)
+        qkv2 = self.qkv_dwconv(self.qkv(x))
+        qc, kc, vc = qkv2[0], qkv[1], qkv[2]
 
-            attn_mh = self.attn_drop(attn_mh)   # [256, 2, 49, 49]
-            attn_mh_fig = attn_mh.clone()
+        qc = rearrange(qc, 'b (head c) h w -> b head c (h w)', head=self.chan_heads)
+        kc = rearrange(kc, 'b (head c) h w -> b head c (h w)', head=self.chan_heads)
+        vc = rearrange(vc, 'b (head c) h w -> b head c (h w)', head=self.chan_heads)
 
-            x1 = attn_mh @ v_mh # [256, 2, 49, 32]
-            x1 = x1.transpose(1, 2) # [B, H-1, N, C/H] -> [B, N, H-1, H/C(=c)], reshape executed later
-            x1 = x1.permute(0, 2, 1, 3).reshape(B * (H//self.window_size[0]) * (W//self.window_size[1]),
-                                                self.window_size[0] * self.window_size[1], -1)  # [256, 49, 64] / [64, 49, 128]
+        qc = torch.nn.functional.normalize(qc, dim=-1)
+        kc = torch.nn.functional.normalize(kc, dim=-1)
 
-            # print('6) x1 shape : ', x1.shape)
-            # x = self.proj(x)
-            # x1 = self.proj_drop(x1) # [256, 49, 2, 32]
+        attn = (qc @ kc.transpose(-2, -1)) * self.temperature
+        attn = attn.softmax(dim=-1)
 
-        # --added-- : CH ----------------------------------------------------------
-        # qkv = self.qkv_dwconv(qkv)
-        qkv_ch = qkv_ch.reshape(3, B_, N_, self.chan_heads, C // self.num_heads)  # [3, B, 3136, 1, 32] / [3, 4, 784, 2, 32]
-        q_ch, k_ch, v_ch = qkv_ch[0], qkv_ch[1], qkv_ch[2]  # [B, 3136, 1, 32]
-        
-        q_ch = q_ch.permute(0, 2, 3, 1) # [B, 1, 32, 3136] / [4, 2, 32, 784]
-        k_ch = k_ch.permute(0, 2, 3, 1)
-        v_ch = v_ch.permute(0, 2, 3, 1)
+        x2 = (attn @ vc)
+        x2 = rearrange(x2, 'b head c (h w) -> b (head c) h w', head=self.num_heads, h=H2, w=W2)
+        # --------------------------- Spatial Over ------------------------- #
 
-        q_ch = torch.nn.functional.normalize(q_ch, dim=-1)
-        k_ch = torch.nn.functional.normalize(k_ch, dim=-1)
+        # --------------------------- Concat Mixing ------------------------ #
 
-        attn_ch = (q_ch @ k_ch.transpose(-2, -1)) * self.temperature   # [B, 1, 32, 32] / [B, 2, 32, 32]
-        attn_ch = attn_ch.softmax(dim=-1)
 
-        # print('7) q ch after shape : ', q_ch.shape)
-        # print('8) attn ch shape : ', attn_ch.shape)
-
-        x2 = (attn_ch @ v_ch)
-        x2 = x2.permute(0, 3, 1, 2) # [B, 1, 32, 3136] -> [B, 3136, 1, 32] / [B, 784, 2, 32]
-
-        # [256, 49, 1, 32]로 만들어야 함. 이후, [256, 49, 96]으로 만들어야 됨.
-        x2 = x2.view(B, H // self.window_size[0], self.window_size[0], W//self.window_size[1], self.window_size[1],
-                     self.chan_heads, -1)   # [B, 8, 8, 7, 7, 1, 32] / [B, 4, 4, 7, 7, 2, 32]
-        x2 = x2.permute(0, 1, 3, 2, 4, 5, 6).contiguous()   # [B, 8, 7, 8, 7, 1, 32]
-        x2 = x2.view(-1, self.window_size[0], self.window_size[1], self.chan_heads, C // self.num_heads)    # [256, 7, 7, 1, 32]
-        x2 = x2.view(-1, self.window_size[0] * self.window_size[1], self.chan_heads, C // self.num_heads)   # [256, 49, 1, 32] / [64, 49, 2, 32]
-        x2 = x2.reshape(-1, self.window_size[0] * self.window_size[1], self.chan_heads * C // self.num_heads) # [256, 49, 32] / [64, 49, 64]
-
-        # print('9) x2 shape : ', x2.shape)
-
-        # added -- cat
+        # spatial :
         x1 = self.proj(x1)
         x1 = self.proj_drop(x1)
+        
+        # channel :
+        x2 = self.project_out(x2)
+        
+        # 새로운 concat 및 게이트를 만들어야 함.
+        out = torch.cat([x1, x2])
 
-        if mh_flag == True:
-            out = torch.cat((x1, x2), dim=2)  # [B, N, H, c] -> [B, N, C]
-        else:
-            out = x2
+
 
         return out  # [256, 49, 96] / [64, 49, 192]
-
 
     def flops(self, N):
         # calculate flops for 1 window with token length of N
@@ -421,7 +430,7 @@ class ChannelwiseAttention(nn.Module):
 
     def vis_reshape(self, vis_all_head, vis_each_head, H_fig, W_fig):
         vis_all = rearrange(vis_all_head,
-                                 '(hw hfig) (ww wfig) -> hw hfig ww wfig', hw=H_fig, ww=W_fig)
+                            '(hw hfig) (ww wfig) -> hw hfig ww wfig', hw=H_fig, ww=W_fig)
         vis_all = vis_all.permute(0, 2, 1, 3).reshape(-1, H_fig, W_fig)
         vis_all = vis_all[:, 0, :].reshape(-1, 7, 7)
         first_shape, _, _ = vis_all.shape
@@ -430,7 +439,7 @@ class ChannelwiseAttention(nn.Module):
         vis_all = rearrange(vis_all, 'hw h ww w -> (hw h) (ww w)').detach().cpu().numpy()
 
         vis_each = rearrange(vis_each_head,
-                            '(hw hfig) (ww wfig) -> hw hfig ww wfig', hw=H_fig, ww=W_fig)
+                             '(hw hfig) (ww wfig) -> hw hfig ww wfig', hw=H_fig, ww=W_fig)
         vis_each = vis_each.permute(0, 2, 1, 3).reshape(-1, H_fig, W_fig)
         vis_each = vis_each[:, 0, :].reshape(-1, 7, 7)
         first_shape, _, _ = vis_each.shape
@@ -441,8 +450,8 @@ class ChannelwiseAttention(nn.Module):
         return vis_all, vis_each
 
 
-# -------------------------------------- CWSA end -------------------------------- #
-
+##########################################################################################
+## Third Arch : Define Depth per Stage
 class SwinTransformerBlock(nn.Module):
     r""" Swin Transformer Block.
 
@@ -468,33 +477,38 @@ class SwinTransformerBlock(nn.Module):
                  act_layer=nn.GELU, norm_layer=nn.LayerNorm,
                  fused_window_process=False, chan_heads=1, depth=1, layer_idx=1):
         super().__init__()
+
         self.dim = dim
         self.input_resolution = input_resolution
         self.num_heads = num_heads
+
+        # window processing
         self.window_size = window_size
         self.shift_size = shift_size
         self.mlp_ratio = mlp_ratio
+
         if min(self.input_resolution) <= self.window_size:
             # if window size is larger than input resolution, we don't partition windows
             self.shift_size = 0
             self.window_size = min(self.input_resolution)
         assert 0 <= self.shift_size < self.window_size, "shift_size must in 0-window_size"
 
+        # attn 전 func
         self.norm1 = norm_layer(dim)
-        # self.attn = WindowAttention(
-        #     dim, window_size=to_2tuple(self.window_size), num_heads=num_heads,
-        #     qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
 
-        self.attn = ChannelwiseAttention(
+        # Attention
+        self.attn = HybridAttention(
             dim, window_size=to_2tuple(self.window_size), num_heads=num_heads, chan_heads=chan_heads,
             qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop,
             depth=depth, layer_idx=layer_idx)
 
+        # attn 후 func
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
 
+        # mask 위한 slice 처리
         if self.shift_size > 0:
             # calculate attention mask for SW-MSA
             H, W = self.input_resolution
@@ -522,32 +536,50 @@ class SwinTransformerBlock(nn.Module):
         self.fused_window_process = fused_window_process
 
     def forward(self, x):
+        '''
+        input --> LN -> SWSA --> LN --> MLP Gate
+          |                  |
+          ----> LN -> CWSA ---
+        '''
         H, W = self.input_resolution
         B, L, C = x.shape
         assert L == H * W, "input feature has wrong size"
 
-        # print('----------------------------- 3) SwinT Block ------------------------')
         shortcut = x
-        x = self.norm1(x)
-        x = x.view(B, H, W, C)
+        x = self.norm1(x).view(B, H, W, C)
 
-        # cyclic shift
+        # cyclic shift and C방향으로 1/2씩 쪼갬, 다음으로 x1만 win*win으로 분할
         if self.shift_size > 0:
+            # default : False
             if not self.fused_window_process:
                 shifted_x = torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
+                x1, x2 = shifted_x[:,:,:,:C//2], shifted_x[:,:,:,C//2:]
                 # partition windows
-                # x_windows = window_partition(shifted_x, self.window_size)  # nW*B, window_size, window_size, C
+                x_windows = window_partition(x1, self.window_size)  # nW*B, window_size, window_size, C
+            # not executed
             else:
                 x_windows = WindowProcess.apply(x, B, H, W, C, -self.shift_size, self.window_size)
         else:
             shifted_x = x
+            x1, x2 = shifted_x[:, :, :, :C // 2], shifted_x[:, :, :, C // 2:]
             # partition windows
-            # x_windows = window_partition(shifted_x, self.window_size)  # nW*B, window_size, window_size, C
+            x_windows = window_partition(x1, self.window_size)  # nW*B, window_size, window_size, C
 
-        # x_windows = x_windows.view(-1, self.window_size * self.window_size, C)  # nW*B, window_size*window_size, C
+        x_windows = x_windows.view(-1, self.window_size * self.window_size, C)  # nW*B, window_size*window_size, C
 
         # W-MSA/SW-MSA
-        attn_windows = self.attn(shifted_x, mask=self.attn_mask)  # [256, 49, 96]이 되어야 함
+        attn_windows = self.attn([x_windows, x2], mask=self.attn_mask)  # [256, 49, 96]이 되어야 함
+
+
+
+
+
+
+
+
+
+
+
 
         # merge windows
         attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
@@ -589,6 +621,8 @@ class SwinTransformerBlock(nn.Module):
         return flops
 
 
+##########################################################################
+## Resizing modules
 class PatchMerging(nn.Module):
     r""" Patch Merging Layer.
 
@@ -638,6 +672,8 @@ class PatchMerging(nn.Module):
         return flops
 
 
+##########################################################################
+## Second Arch : Define Stage
 class BasicLayer(nn.Module):
     """ A basic Swin Transformer layer for one stage.
 
@@ -694,7 +730,6 @@ class BasicLayer(nn.Module):
             self.downsample = None
 
     def forward(self, x):
-        # print('----------------------------- 2) BasicLayer ----------------------------------')
         for blk in self.blocks:
             if self.use_checkpoint:
                 x = checkpoint.checkpoint(blk, x)
@@ -716,6 +751,8 @@ class BasicLayer(nn.Module):
         return flops
 
 
+##########################################################################
+## Patch Embedding
 class PatchEmbed(nn.Module):
     r""" Image to Patch Embedding
 
@@ -764,6 +801,8 @@ class PatchEmbed(nn.Module):
         return flops
 
 
+##########################################################################
+## SwinTransformer First Arch
 class SwinTransformer(nn.Module):
     r""" Swin Transformer
         A PyTorch impl of : `Swin Transformer: Hierarchical Vision Transformer using Shifted Windows`  -
@@ -789,6 +828,10 @@ class SwinTransformer(nn.Module):
         patch_norm (bool): If True, add normalization after patch embedding. Default: True
         use_checkpoint (bool): Whether to use checkpointing to save memory. Default: False
         fused_window_process (bool, optional): If True, use one kernel to fused window shift & window partition for acceleration, similar for the reversed part. Default: False
+    
+    1) 전체에 pos_embed 더하기
+    2) spatial에만 pos_embed 더하기
+    3) 아예 안 더하기
     """
 
     def __init__(self, img_size=224, patch_size=4, in_chans=3, num_classes=1000,
@@ -874,7 +917,6 @@ class SwinTransformer(nn.Module):
         return {'relative_position_bias_table'}
 
     def forward_features(self, x):
-        # print('----------------------------- 1) SwinTransformer-----------------------------')
         x = self.patch_embed(x)
         if self.ape:
             x = x + self.absolute_pos_embed
@@ -900,197 +942,3 @@ class SwinTransformer(nn.Module):
         flops += self.num_features * self.patches_resolution[0] * self.patches_resolution[1] // (2 ** self.num_layers)
         flops += self.num_features * self.num_classes
         return flops
-
-
-
-'''
-# --------------------------- To make Heatmap Start -------------------- #
-        def savefig(attn_mh, attn_ch):
-            attention_matrix = attn_mh.clone()
-            # _, M_fig, H_fig, W_fig = attention_matrix.shape # H/W_fig = 49
-            # attention_matrix = attention_matrix.reshape(B_, (H // self.window_size[0]), (W // self.window_size[1]),
-            #                                             -1, H_fig, W_fig)
-            # attention_matrix = attention_matrix.permute(0, 3, 1, 2, 4, 5)
-            # attention_matrix = attention_matrix.permute(0, 1, 2, 4, 3, 5)
-            # attention_matrix = rearrange(attention_matrix, 'b mh h hw w ww -> b mh (h hw) (w ww)')  # B, Head, 49h, 49w
-
-            for batch_idx in range(B_):
-                # for i in range(self.num_heads - self.chan_heads):
-                #     fig, ax = plt.subplots()
-                #     ax.imshow(attention_matrix[batch_idx][i].detach().cpu().numpy(), cmap='jet')
-                #     # ax.set_ylim(ax.get_ylim()[::-1])
-                #     filename = f"spat_{batch_idx}_{self.layer_idx}_{self.depth}_{i}.png"
-                #     filepath = os.path.join('./experiment', 'plt', filename)
-                #     plt.savefig(filepath)
-                #     plt.close()
-                #
-                # for i in range(self.chan_heads):
-                #     fig, ax = plt.subplots()
-                #     ax.imshow(attention_matrix_ch[batch_idx][i].detach().cpu().numpy(), cmap='jet')
-                #     # ax.set_ylim(ax.get_ylim()[::-1])
-                #     filename = f"chan_{batch_idx}_{self.layer_idx}_{self.depth}_{i}.png"
-                #     filepath = os.path.join('./experiment', 'plt', filename)
-                #     plt.savefig(filepath)
-                #     plt.close()
-
-
-                # fig = plt.figure(figsize=(16, 8))
-                # filename = f"Vis_{batch_idx}_{self.layer_idx}_{self.depth}.png"
-                # filepath = os.path.join('./experiment', 'plt', filename)
-                # fig.suptitle(filename, fontsize=24)
-                #
-                # rows = 2
-                # cols = (self.num_heads - self.chan_heads) // 2 + 1
-                #
-                # attn_matrix_clone = attention_matrix.clone()
-                # vis_all_head = torch.zeros(attn_matrix_clone[0, 0].shape) # 모든 head의 같은 위치의 것을 합하기(패치 수만큼 존재)
-                # vis_each_head = torch.zeros(attn_matrix_clone[0, 0].shape)    # 하나의 head의 모든 걸 합하기(헤드 수만큼 존재)
-                # vis_all_head, vis_each_head = self.vis_reshape(vis_all_head, vis_each_head, H_fig, W_fig)
-                #
-                # vis_shape = vis_all_head.shape
-                # vis_all_arr = []
-                #
-                # for head_idx in range(self.num_heads - self.chan_heads):  # visualize the 48th rows of attention matrices in the 0-last heads
-                #     # attn_heatmap = attention_matrix[batch_idx, head_idx].reshape((7,7)).detach().cpu().numpy()
-                #     attn_heatmap = rearrange(attn_matrix_clone[batch_idx, head_idx],
-                #                              '(hw hfig) (ww wfig) -> hw hfig ww wfig', hfig=H_fig, wfig=W_fig)
-                #     print('6) attn_heatmap shape ', attn_heatmap.shape)
-                #     attn_heatmap = attn_heatmap.permute(0, 2, 1, 3).reshape(-1, H_fig, W_fig)   # [hxw, 49, 49]
-                #     print('7) attn_heatmap shape ', attn_heatmap.shape)
-                #
-                #     # attn_heatmap = attn_heatmap[:, 24, :].reshape(-1, 7, 7)   # [hw, 7, 7]
-                #     attn_heatmap = attn_heatmap.reshape(-1, 49, 7, 7)   # [hxw, 49, 7, 7]
-                #     print('8) attn_heatmap shape ', attn_heatmap.shape)
-                #     hw, second_shape, _, _ = attn_heatmap.shape
-                #     attn_heatmap = attn_heatmap.reshape(int(math.sqrt(hw)), int(math.sqrt(hw)), 7, 7)
-                #     print('9) attn_heatmap shape ', attn_heatmap.shape)
-                #     attn_heatmap = rearrange(attn_heatmap, 'hw ww h w -> (hw h) (ww w)').detach().cpu().numpy()
-                #     print('10) attn_heatmap shape ', attn_heatmap.shape)
-                #     vis_all_head += attn_heatmap
-                #     ax = fig.add_subplot(rows, cols, head_idx + 1)
-                #     ax.imshow(attn_heatmap, cmap='jet')
-                #
-                # ax = fig.add_subplot(rows, cols, head_idx + 2)  # +2 to plot in the next subplot
-                # ax.imshow(vis_all_head, cmap='jet')
-                #
-                # plt.savefig(filepath)
-                # plt.close(fig)
-                #
-                #
-                # # 7x7만 따로 224x224로 upsample
-                # if self.layer_idx == 3:
-                #     fig = plt.figure(figsize=(16, 8))
-                #     filename = f"VisUp_{batch_idx}_{self.layer_idx}_{self.depth}.png"
-                #     filepath = os.path.join('./experiment', 'plt', filename)
-                #     fig.suptitle(filename, fontsize=24)
-                #
-                #     rows = 2
-                #     cols = (self.num_heads - self.chan_heads) // 2
-                #
-                #     vis_each_head = torch.zeros(224, 224)
-                #
-                #     for head_idx in range(self.num_heads - self.chan_heads):
-                #         # visualize the 48th rows of attention matrices in the 0-last heads
-                #         attn_heatmap = rearrange(attn_matrix_clone[batch_idx, head_idx],
-                #                                  '(hw hfig) (ww wfig) -> hw hfig ww wfig', hw=H_fig, ww=W_fig)
-                #         attn_heatmap = attn_heatmap.permute(0, 2, 1, 3).reshape(-1, H_fig, W_fig)
-                #         attn_heatmap = attn_heatmap[:, 24, :].reshape(-1, 7, 7)
-                #         first_shape, _, _ = attn_heatmap.shape
-                #         attn_heatmap = attn_heatmap.reshape(int(math.sqrt(first_shape)),
-                #                                             int(math.sqrt(first_shape)), 7, 7)
-                #         attn_heatmap = attn_heatmap.permute(0, 2, 1, 3)
-                #         attn_heatmap = rearrange(attn_heatmap, 'hw h ww w -> (hw h) (ww w)')
-                #
-                #         # Create an upsampling layer and apply it
-                #         upsampler = nn.Upsample(scale_factor=32, mode='bilinear',
-                #                                 align_corners=True)  # align_corners=True might be needed for 'bilinear' mode
-                #         upscaled_attn_heatmap = upsampler(
-                #             attn_heatmap.unsqueeze(0).unsqueeze(0))  # Add batch and channel dimensions
-                #
-                #         upscaled_attn_heatmap = upscaled_attn_heatmap.squeeze().detach().cpu().numpy()
-                #
-                #         vis_each_head += upscaled_attn_heatmap
-                #
-                #         ax = fig.add_subplot(rows, cols, head_idx + 1)
-                #         ax.imshow(upscaled_attn_heatmap, cmap='jet')
-                #
-                #     plt.savefig(filepath)
-                #     plt.close(fig)
-                #
-                #     # --------- 4th layer upscale sum 따로 저장
-                #     fig = plt.figure(figsize=(16, 8))
-                #     filename = f"VisUpSum_{batch_idx}_{self.layer_idx}_{self.depth}.png"
-                #     filepath = os.path.join('./experiment', 'plt', filename)
-                #     fig.suptitle(filename, fontsize=24)
-                #
-                #     rows = 1
-                #     cols = 1
-                #
-                #     ax = fig.add_subplot(rows, cols, 1)
-                #     ax.imshow(vis_each_head, cmap='jet')
-                #
-                #     plt.savefig(filepath)
-                #     plt.close(fig)
-
-                # channel-wise Figure drawing ----------------------------
-                attn_mat_ch = attn_ch[batch_idx].clone()
-                spatial_n = int(math.sqrt(attn_mat_ch.shape[2]))
-                attn_mat_ch = rearrange(attn_mat_ch, 'head c (h w) -> (head c) h w', h=spatial_n, w=spatial_n)
-                out = attn_mat_ch  # delete batch dimension
-
-                head_split = 0
-                fig = plt.figure(figsize=(16, 8))
-                filename = f"z_{batch_idx}_{self.layer_idx}_{self.depth}_{head_split}.png"
-                filepath = os.path.join('./experiment', 'plt', filename)
-                fig.suptitle(filename, fontsize=24)
-
-                put_pic_idx = 0
-                rows = 2
-                cols = 6
-
-                # 하나의 그림에 무조건 12개씩만 넣음
-                # upsample 하는것 추가해
-                for chan_idx in range(attn_mat_ch.shape[0]):
-                    if chan_idx != 0 and chan_idx % 12 == 0:
-                        plt.savefig(filepath)
-                        plt.close(fig)
-
-                        head_split += 1
-                        fig = plt.figure(figsize=(16, 8))
-                        filename = f"z_{batch_idx}_{self.layer_idx}_{self.depth}_{head_split}.png"
-                        filepath = os.path.join('./experiment', 'plt', filename)
-                        fig.suptitle(filename, fontsize=24)
-                        put_pic_idx = 0
-
-                    # 224x224로 upsample
-                    if spatial_n == 56 :
-                        upsampler = nn.Upsample(scale_factor=4, mode='bilinear',
-                                                align_corners=True)  # align_corners=True might be needed for 'bilinear' mode
-                    elif spatial_n == 28 :
-                        upsampler = nn.Upsample(scale_factor=8, mode='bilinear',
-                                                align_corners=True)  # align_corners=True might be needed for 'bilinear' mode
-
-                    elif spatial_n == 14 :
-                        upsampler = nn.Upsample(scale_factor=16, mode='bilinear',
-                                                align_corners=True)  # align_corners=True might be needed for 'bilinear' mode
-
-                    elif spatial_n == 7 :
-                        upsampler = nn.Upsample(scale_factor=32, mode='bilinear',
-                                                align_corners=True)  # align_corners=True might be needed for 'bilinear' mode
-
-                    out_pic = upsampler(out[chan_idx].unsqueeze(0).unsqueeze(0)).squeeze().detach().cpu().numpy()
-                    ax = fig.add_subplot(rows, cols, put_pic_idx + 1)
-                    ax.imshow(out_pic, cmap='jet')
-                    put_pic_idx += 1
-
-                plt.savefig(filepath)
-                plt.close(fig)
-        # --------------------------- To make Heatmap End ---------------------  #
-        
-attn_ch_fig = x2.clone()
-
-        if mh_flag == True:
-            savefig(attn_mh_fig, attn_ch_fig)
-        else :
-            savefig(torch.randn(1, 1), attn_ch_fig)
-'''

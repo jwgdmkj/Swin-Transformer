@@ -7,3 +7,6 @@ MODEL:
     DEPTHS: [ 2, 2, 18, 2 ]
     NUM_HEADS: [ 3, 6, 12, 24 ]
     WINDOW_SIZE: 7
+
+TRAIN:
+  EPOCHS: 90

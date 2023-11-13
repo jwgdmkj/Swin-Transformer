@@ -194,13 +194,6 @@ python -m torch.distributed.launch --nproc_per_node 8 --master_port 12345  main.
 --accumulation-steps 2 [--use-checkpoint]
 ```
 
-`Swin-T : Channel-wise Self Attention`:
-
-```bash
-python3 -m torch.distributed.launch --nproc_per_node 1 --master_port 12345  main.py \
---cfg configs/swin/swin_cwsatiny_patch4_window7_224.yaml --data-path <imagenet-path> --batch-size 4
-```
-
 ### Pre-training on ImageNet-22K
 
 For example, to pre-train a `Swin-B` model on ImageNet-22K:

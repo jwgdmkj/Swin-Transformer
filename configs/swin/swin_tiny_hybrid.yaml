@@ -1,0 +1,17 @@
+# 96 차원이 들어오면, 48차원은 Spatial-wise로, 48차원은 Channel-wise
+# 1) Hybrid Transformer Block을 구현
+# 2) Gate를 제거
+
+MODEL:
+  TYPE: swin_hybrid
+  NAME: swin_tiny_hybrid
+  DROP_PATH_RATE: 0.2
+  SWIN:
+    EMBED_DIM: 96
+    DEPTHS: [ 2, 2, 6, 2 ]
+    NUM_HEADS: [ 3, 6, 12, 24 ]
+    WINDOW_SIZE: 7
+    CHAN_HEADS: [1, 2, 4, 8]
+
+TRAIN:
+  EPOCHS: 90

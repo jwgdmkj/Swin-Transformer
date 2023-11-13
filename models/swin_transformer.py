@@ -11,6 +11,10 @@ import torch.utils.checkpoint as checkpoint
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 import pdb
 
+import matplotlib.pyplot as plt
+from einops import rearrange
+import math
+
 '''
 각각에 따른 shape 변화(window_size: 8 & input shape: [B, 3, 224, 224] & 임베딩: [B, 3136(56X56), 96(임베딩 차원)] 가정
 depth: [2, 2, 18, 2], window_size를 [7, 7, 7, 7]이라 가정 시
@@ -112,7 +116,8 @@ class WindowAttention(nn.Module):
         proj_drop (float, optional): Dropout ratio of output. Default: 0.0
     """
 
-    def __init__(self, dim, window_size, num_heads, qkv_bias=True, qk_scale=None, attn_drop=0., proj_drop=0.):
+    def __init__(self, dim, window_size, num_heads, qkv_bias=True, qk_scale=None, attn_drop=0., proj_drop=0.,
+                depth=0, layer_idx=0):
 
         super().__init__()
         self.dim = dim
@@ -145,6 +150,9 @@ class WindowAttention(nn.Module):
 
         trunc_normal_(self.relative_position_bias_table, std=.02)
         self.softmax = nn.Softmax(dim=-1)
+
+        self.depth = depth
+        self.layer_idx = layer_idx
 
     def forward(self, x, mask=None):
         """
@@ -179,19 +187,129 @@ class WindowAttention(nn.Module):
         # print('attn second : ', attn.shape)
 
         if mask is not None:
-            # print('--------------------- mask start ------------------------')
             nW = mask.shape[0]
-            # print('| mask shape ', mask.shape)
-            attn = attn.view(B_ // nW, nW, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
-            # print('| attn, nW ', attn.shape, nW)
+            attn = attn.view(B_ // nW, nW, self.num_heads, N, N)
+            attn = attn + mask.unsqueeze(1).unsqueeze(0)
             attn = attn.view(-1, self.num_heads, N, N)
-            # print('| attn view ', attn.shape)
             attn = self.softmax(attn)
-            # print('--------------------- mask over -------------------------')
         else:
             attn = self.softmax(attn)
 
         attn = self.attn_drop(attn)
+        attn_fig = attn.clone()
+
+        # --------------------------- To make Heatmap Start -------------------- #
+        # def savefig(attn_mh):
+        #     attention_matrix = attn_mh.clone()
+        #     H, W = int(math.sqrt(attention_matrix.shape[0] // 2)), int(math.sqrt(attention_matrix.shape[0] // 2))
+        #     _, M_fig, H_fig, W_fig = attention_matrix.shape  # H/W_fig = 49
+        #     attention_matrix = attention_matrix.reshape(2, H, W,
+        #                                                 -1, H_fig, W_fig)
+        #     attention_matrix = attention_matrix.permute(0, 3, 1, 2, 4, 5)
+        #     attention_matrix = attention_matrix.permute(0, 1, 2, 4, 3, 5)
+        #     attention_matrix = rearrange(attention_matrix, 'b mh h hw w ww -> b mh (h hw) (w ww)')  # B, Head, 49h, 49w
+        #
+        #     for batch_idx in range(2):
+        #         '''
+        #         head 별로 24번째 row of attention을 visualization
+        #         batch, head, 49xh, 49xw
+        #         이를 [n, 49, 7, 7]로 바꾸는 과정. 따라서 총 n개의 윈도우들에 대한 7x7이 만들어짐.
+        #         '''
+        #
+        #         fig = plt.figure(figsize=(16, 8))
+        #         filename = f"Vis_{batch_idx}_{self.layer_idx}_{self.depth}.png"
+        #         filepath = os.path.join('./experiment', 'plt_swin', filename)
+        #         fig.suptitle(filename, fontsize=24)
+        #
+        #         rows = 2
+        #         cols = (self.num_heads) // 2 + 1
+        #
+        #         attn_matrix_clone = attention_matrix.clone()
+        #         vis_all_head = torch.zeros(attn_matrix_clone[0, 0].shape)  # 모든 head의 같은 위치의 것을 합하기(패치 수만큼 존재)
+        #         vis_each_head = torch.zeros(attn_matrix_clone[0, 0].shape)  # 하나의 head의 모든 걸 합하기(헤드 수만큼 존재)
+        #         vis_all_head, vis_each_head = self.vis_reshape(vis_all_head, vis_each_head, H_fig, W_fig)
+        #
+        #         vis_shape = vis_all_head.shape
+        #         vis_all_arr = []
+        #
+        #         for head_idx in range(self.num_heads):  # visualize the 48th rows of attention matrices in the 0-last heads
+        #             # attn_heatmap = attention_matrix[batch_idx, head_idx].reshape((7,7)).detach().cpu().numpy()
+        #             attn_heatmap = rearrange(attn_matrix_clone[batch_idx, head_idx],
+        #                                      '(hw hfig) (ww wfig) -> hw hfig ww wfig', hfig=H_fig, wfig=W_fig)
+        #             attn_heatmap = attn_heatmap.permute(0, 2, 1, 3).reshape(-1, H_fig, W_fig)
+        #             attn_heatmap = attn_heatmap[:, 24, :].reshape(-1, 7, 7)
+        #             first_shape, _, _ = attn_heatmap.shape
+        #             attn_heatmap = attn_heatmap.reshape(int(math.sqrt(first_shape)), int(math.sqrt(first_shape)), 7, 7)
+        #             attn_heatmap = rearrange(attn_heatmap, 'hw ww h w -> (hw h) (ww w)').detach().cpu().numpy()
+        #             vis_all_head += attn_heatmap
+        #             ax = fig.add_subplot(rows, cols, head_idx + 1)
+        #             ax.imshow(attn_heatmap, cmap='jet')
+        #
+        #         ax = fig.add_subplot(rows, cols, head_idx + 2)  # +2 to plot in the next subplot
+        #         ax.imshow(vis_all_head, cmap='jet')
+        #
+        #         plt.savefig(filepath)
+        #         plt.close(fig)
+        #
+        #         # 7x7만 따로 224x224로 upsample
+        #         if self.layer_idx == 3:
+        #             fig = plt.figure(figsize=(16, 8))
+        #             filename = f"VisUp_{batch_idx}_{self.layer_idx}_{self.depth}.png"
+        #             filepath = os.path.join('./experiment', 'plt_swin', filename)
+        #             fig.suptitle(filename, fontsize=24)
+        #
+        #             rows = 2
+        #             cols = (self.num_heads) // 2 + 1
+        #
+        #             vis_each_head = torch.zeros(224, 224)
+        #
+        #             for head_idx in range(self.num_heads):
+        #                 # visualize the 48th rows of attention matrices in the 0-last heads
+        #                 attn_heatmap = rearrange(attn_matrix_clone[batch_idx, head_idx],
+        #                                          '(hw hfig) (ww wfig) -> hw hfig ww wfig', hw=H_fig, ww=W_fig)
+        #                 attn_heatmap = attn_heatmap.permute(0, 2, 1, 3).reshape(-1, H_fig, W_fig)
+        #                 attn_heatmap = attn_heatmap[:, 24, :].reshape(-1, 7, 7)
+        #                 first_shape, _, _ = attn_heatmap.shape
+        #                 attn_heatmap = attn_heatmap.reshape(int(math.sqrt(first_shape)),
+        #                                                     int(math.sqrt(first_shape)), 7, 7)
+        #                 attn_heatmap = attn_heatmap.permute(0, 2, 1, 3)
+        #                 attn_heatmap = rearrange(attn_heatmap, 'hw h ww w -> (hw h) (ww w)')
+        #
+        #                 # Create an upsampling layer and apply it
+        #                 upsampler = nn.Upsample(scale_factor=32, mode='bilinear',
+        #                                         align_corners=True)  # align_corners=True might be needed for 'bilinear' mode
+        #                 upscaled_attn_heatmap = upsampler(
+        #                     attn_heatmap.unsqueeze(0).unsqueeze(0))  # Add batch and channel dimensions
+        #
+        #                 upscaled_attn_heatmap = upscaled_attn_heatmap.squeeze().detach().cpu().numpy()
+        #
+        #                 vis_each_head += upscaled_attn_heatmap
+        #
+        #                 ax = fig.add_subplot(rows, cols, head_idx + 1)
+        #                 ax.imshow(upscaled_attn_heatmap, cmap='jet')
+        #
+        #             plt.savefig(filepath)
+        #             plt.close(fig)
+        #
+        #             # --------- 4th layer upscale sum 따로 저장
+        #             fig = plt.figure(figsize=(16, 8))
+        #             filename = f"VisUpSum_{batch_idx}_{self.layer_idx}_{self.depth}.png"
+        #             filepath = os.path.join('./experiment', 'plt_swin', filename)
+        #             fig.suptitle(filename, fontsize=24)
+        #
+        #             rows = 1
+        #             cols = 1
+        #
+        #             ax = fig.add_subplot(rows, cols, 1)
+        #             ax.imshow(vis_each_head, cmap='jet')
+        #
+        #             plt.savefig(filepath)
+        #             plt.close(fig)
+
+        # --------------------------- To make Heatmap End ---------------------  #
+
+        # savefig(attn_fig)
+
         # print('attn third : ', attn.shape)
 
         x = (attn @ v)
@@ -221,6 +339,27 @@ class WindowAttention(nn.Module):
         flops += N * self.dim * self.dim
         return flops
 
+    def vis_reshape(self, vis_all_head, vis_each_head, H_fig, W_fig):
+        vis_all = rearrange(vis_all_head,
+                                 '(hw hfig) (ww wfig) -> hw hfig ww wfig', hw=H_fig, ww=W_fig)
+        vis_all = vis_all.permute(0, 2, 1, 3).reshape(-1, H_fig, W_fig)
+        vis_all = vis_all[:, 0, :].reshape(-1, 7, 7)
+        first_shape, _, _ = vis_all.shape
+        vis_all = vis_all.reshape(int(math.sqrt(first_shape)), int(math.sqrt(first_shape)), 7, 7)
+        vis_all = vis_all.permute(0, 2, 1, 3)
+        vis_all = rearrange(vis_all, 'hw h ww w -> (hw h) (ww w)').detach().cpu().numpy()
+
+        vis_each = rearrange(vis_each_head,
+                            '(hw hfig) (ww wfig) -> hw hfig ww wfig', hw=H_fig, ww=W_fig)
+        vis_each = vis_each.permute(0, 2, 1, 3).reshape(-1, H_fig, W_fig)
+        vis_each = vis_each[:, 0, :].reshape(-1, 7, 7)
+        first_shape, _, _ = vis_each.shape
+        vis_each = vis_each.reshape(int(math.sqrt(first_shape)), int(math.sqrt(first_shape)), 7, 7)
+        vis_each = vis_each.permute(0, 2, 1, 3)
+        vis_each = rearrange(vis_each, 'hw h ww w -> (hw h) (ww w)').detach().cpu().numpy()
+
+        return vis_all, vis_each
+
 
 class SwinTransformerBlock(nn.Module):
     r""" Swin Transformer Block.
@@ -245,7 +384,7 @@ class SwinTransformerBlock(nn.Module):
     def __init__(self, dim, input_resolution, num_heads, window_size=7, shift_size=0,
                  mlp_ratio=4., qkv_bias=True, qk_scale=None, drop=0., attn_drop=0., drop_path=0.,
                  act_layer=nn.GELU, norm_layer=nn.LayerNorm,
-                 fused_window_process=False):
+                 fused_window_process=False, depth=1, layer_idx=1):
         super().__init__()
         self.dim = dim
         self.input_resolution = input_resolution
@@ -262,7 +401,8 @@ class SwinTransformerBlock(nn.Module):
         self.norm1 = norm_layer(dim)
         self.attn = WindowAttention(
             dim, window_size=to_2tuple(self.window_size), num_heads=num_heads,
-            qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
+            qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop,
+            depth=depth, layer_idx=layer_idx)
 
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(dim)
@@ -459,7 +599,7 @@ class BasicLayer(nn.Module):
     def __init__(self, dim, input_resolution, depth, num_heads, window_size,
                  mlp_ratio=4., qkv_bias=True, qk_scale=None, drop=0., attn_drop=0.,
                  drop_path=0., norm_layer=nn.LayerNorm, downsample=None, use_checkpoint=False,
-                 fused_window_process=False):
+                 fused_window_process=False, layer_idx=1):
 
         super().__init__()
         self.dim = dim
@@ -477,7 +617,9 @@ class BasicLayer(nn.Module):
                                  drop=drop, attn_drop=attn_drop,
                                  drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
                                  norm_layer=norm_layer,
-                                 fused_window_process=fused_window_process)
+                                 fused_window_process=fused_window_process,
+                                 depth=i,
+                                 layer_idx=layer_idx)
             for i in range(depth)])
 
         # patch merging layer
@@ -637,7 +779,8 @@ class SwinTransformer(nn.Module):
                                norm_layer=norm_layer,
                                downsample=PatchMerging if (i_layer < self.num_layers - 1) else None,
                                use_checkpoint=use_checkpoint,
-                               fused_window_process=fused_window_process)
+                               fused_window_process=fused_window_process,
+                               layer_idx=i_layer)
             self.layers.append(layer)
 
         self.norm = norm_layer(self.num_features)
@@ -665,7 +808,6 @@ class SwinTransformer(nn.Module):
 
     def forward_features(self, x):
         # print('----------------------------- 1) SwinTransformer-----------------------------')
-        # print('fisrt feature : ', x.shape)
         x = self.patch_embed(x)
         if self.ape:
             x = x + self.absolute_pos_embed

@@ -1,10 +1,13 @@
 MODEL:
-  TYPE: swin_cwsa
-  NAME: swin_cswatiny_patch4_window7_224
+  TYPE: swin_se
+  NAME: swin_tiny_se
   DROP_PATH_RATE: 0.2
   SWIN:
-    EMBED_DIM: 64
+    EMBED_DIM: 48
     DEPTHS: [ 2, 2, 6, 2 ]
     NUM_HEADS: [ 3, 6, 12, 24 ]
     WINDOW_SIZE: 7
     CHAN_HEADS: [1, 2, 4, 8]
+
+TRAIN:
+  EPOCHS: 90

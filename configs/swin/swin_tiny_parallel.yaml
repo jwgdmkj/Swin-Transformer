@@ -1,12 +1,13 @@
 MODEL:
-  TYPE: swin
-  NAME: swin_tiny_patch4_window7_224
+  TYPE: swin_parallel
+  NAME: swin_tiny_parallel
   DROP_PATH_RATE: 0.2
   SWIN:
-    EMBED_DIM: 96
+    EMBED_DIM: 48
     DEPTHS: [ 2, 2, 6, 2 ]
     NUM_HEADS: [ 3, 6, 12, 24 ]
     WINDOW_SIZE: 7
+    CHAN_HEADS: [1, 2, 4, 8]
 
 TRAIN:
-  EPOCHS: 300
+  EPOCHS: 90

@@ -6,6 +6,7 @@
 # --------------------------------------------------------
 
 import os
+import pdb
 import time
 import json
 import random
@@ -29,10 +30,22 @@ from logger import create_logger
 from utils import load_checkpoint, load_pretrained, save_checkpoint, NativeScalerWithGradNormCount, auto_resume_helper, \
     reduce_tensor
 
-# python3 -m torch.distributed.launch --nproc_per_node 1 --master_port 10080  main.py --cfg configs/swin/swin_tiny_patch4_window7_224.yaml --data-path /data/dataset/imagenet/ --batch-size 4
+# training
+# cifar :
+# python3 -m torch.distributed.launch --nproc_per_node 1 --master_port 10080  main.py --cfg configs/swin/swin_tiny_patch4_window7_224.yaml --data-path /data/dataset/classification/cifar100 --batch-size 16 --set cifar100
+
+# python3 -m torch.distributed.launch --nproc_per_node 1 --master_port 10080  main.py --cfg configs/swin/swin_tiny_patch4_window7_224.yaml --data-path /data/dataset/imagenet-mini/ --batch-size 4
 # python3 main.py --data-path /data/dataset/imagenet/ --model --cfg configs/swin/swin_tiny_patch4_window7_224.yaml --batch-size 4
 # python3 -m torch.distributed.launch --nproc_per_node 1 --master_port 10080 main.py --eval --cfg configs/swin/swin_base_patch4_window7_224.yaml --resume ./weights/swin_tiny_patch4_window7_224.pth --data-path /data/dataset/imagenet/
 # python3 -m torch.distributed.launch --nproc_per_node 1 --master_port 10080  main.py --cfg configs/swin/swin_cwsatiny_patch4_window7_224.yaml --data-path /data/dataset/imagenet/ --batch-size 4
+
+# evaluation
+# CUDA_VISIBLE_DEVICES=1 python3 -m torch.distributed.launch --nproc_per_node 1 --master_port 10080 main.py --eval --cfg configs/swin/swin_cwsatiny_patch4_window7_224.yaml --resume <checkpoint> --data-path /data/dataset/imagenet_small
+
+# parallel
+
+
+from torchsummary import summary as summary_
 
 def parse_option():
     parser = argparse.ArgumentParser('Swin Transformer training and evaluation script', add_help=False)
@@ -76,9 +89,13 @@ def parse_option():
     parser.add_argument('--fused_window_process', action='store_true',
                         help='Fused window shift & window partition, similar for reversed part.')
     parser.add_argument('--fused_layernorm', action='store_true', help='Use fused layernorm.')
+
     ## overwrite optimizer in config (*.yaml) if specified, e.g., fused_adam/fused_lamb
     parser.add_argument('--optim', type=str,
                         help='overwrite optimizer if provided, can be adamw/sgd/fused_adam/fused_lamb.')
+
+    ## Dataset selection
+    parser.add_argument('--set', type=str, default='imagenet')
 
     args, unparsed = parser.parse_known_args()
 
@@ -97,11 +114,18 @@ def main(config):
 
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f"number of params: {n_parameters}")
-    if hasattr(model, 'flops'):
-        flops = model.flops()
-        logger.info(f"number of GFLOPs: {flops / 1e9}")
+
+    # Flops
+    # if hasattr(model, 'flops'):
+    #     flops = model.flops()
+    #     logger.info(f"number of GFLOPs: {flops / 1e9}")
 
     model.cuda()
+
+    # -------------- torch summary ------------------
+    summary_(model,(3,224,224),batch_size=512)
+    # -------------- torch summary ------------------
+
     model_without_ddp = model
 
     optimizer = build_optimizer(config, model)
@@ -135,6 +159,7 @@ def main(config):
             logger.info(f'auto resuming from {resume_file}')
         else:
             logger.info(f'no checkpoint found in {config.OUTPUT}, ignoring auto resume')
+
 
     if config.MODEL.RESUME:
         max_accuracy = load_checkpoint(config, model_without_ddp, optimizer, lr_scheduler, loss_scaler, logger)
